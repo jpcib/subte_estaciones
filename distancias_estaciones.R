@@ -1,12 +1,22 @@
+# install.packages("sfdep")
+# install.packages("osmdata")
+
 library(tidyverse)
 library(sf)
-library(igraph)
+library(sfdep)
+library(osmdata)
+# library(igraph)
 
 estaciones <- read_sf("https://cdn.buenosaires.gob.ar/datosabiertos/datasets/sbase/subte-estaciones/estaciones-de-subte.geojson") %>% 
   janitor::clean_names() %>% 
   glimpse()
 
 st_crs(estaciones)
+
+#Spatial autocorrelation 
+# Moran I https://r.iresmi.net/posts/2023/spatial_autocorrelation/index.html
+
+
 #Calcular distancias entre estaciones mas cercanas de la misma linea
 
 #Test linea E
