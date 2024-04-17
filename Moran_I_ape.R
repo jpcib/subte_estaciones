@@ -1,4 +1,4 @@
-install.packages("ape")
+# install.packages("ape")
 library(ape)
 # https://stats.oarc.ucla.edu/r/faq/how-can-i-calculate-morans-i-in-r/
 ozone <- read.table("https://stats.idre.ucla.edu/stat/r/faq/ozone.csv", sep=",", header=T)
