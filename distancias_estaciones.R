@@ -1,10 +1,12 @@
 # install.packages("sfdep")
 # install.packages("osmdata")
+# install.packages('tidytransit')
 
 library(tidyverse)
 library(sf)
 library(sfdep)
 library(osmdata)
+# library(tidytransit)
 # library(igraph)
 
 estaciones <- read_sf("https://cdn.buenosaires.gob.ar/datosabiertos/datasets/sbase/subte-estaciones/estaciones-de-subte.geojson") %>% 
@@ -15,26 +17,57 @@ st_crs(estaciones)
 
 #Spatial autocorrelation 
 # Moran I https://r.iresmi.net/posts/2023/spatial_autocorrelation/index.html
-
+# Later .-
 
 #Calcular distancias entre estaciones mas cercanas de la misma linea
 
-#Test linea E
+#Test linea A
 
 data <- estaciones %>% 
-  filter(linea == "A") %>% 
+  filter(linea == "A") %>%
   glimpse() %>% 
   print()
 
-distances <- st_distance(data)
-distances
+distancias <- st_distance(data)
+distancias[1:18,1:6]
+view(dist)
 
-max_distances <- max(distances)
-max_distances
 
-max_indices <- as.data.frame(which(distances == max_distances, arr.ind = TRUE))[,2]
-max_indices
+distancias.max <- max(distancias)
+distancias.max
 
+#Me quedo con los indices de las filas 
+indices.max <- as.data.frame(which(distancias == distancias.max, arr.ind = TRUE))[,1]
+indices.max
+
+#Vuelvo al dataset original 
+
+cabeceras <- data %>% 
+  slice(indices.max) %>% 
+  print()
+
+data
+
+#Data reordenada cabeceras. aun queda desordena dos intermedias
+data1 <- data %>% 
+  slice(-indices.max) %>% 
+  add_row(cabeceras[1,]) %>% 
+  add_row(cabeceras[2,], .before = 1) %>% 
+  print()
+
+distancias1 <- st_distance(data1)
+distancias1[1:18,1:6]
+view(distancias1)
+
+data1 <- data %>% 
+  slice(-indices.max) %>% 
+  add_row(cabeceras[1,]) %>% 
+  add_row(cabeceras[2,], .before = 1) %>% 
+  print()
+
+distancias1 <- st_distance(data1)
+distancias1[1:18,1:6]
+view(distancias1)
 #Creo necesito la matriz completa, ordenar y extraer los indices de los valores en 
 ## diagonal. 
 #Posiblemente esto solo sirva para ordenar, o incluso tenga que reemplazarlo 
@@ -54,12 +87,26 @@ print(final_distances)
 glimpse(final_distances)
 class(final_distances)
 
-class(distances)
-  select(max_indices[1,2]) %>% 
-  glimpse()
-  arrange(as.integer(max_indices[1,2])) %>% 
+# class(distances)
+  # select(max_indices[1,2]) %>% 
+  # glimpse()
+  # arrange(as.integer(max_indices[1,2]))
+
+#Dijkstra igraph test ####
+# https://rstudio-pubs-static.s3.amazonaws.com/771577_dbc6caf1be084434928f3249ccd40c00.html
+
+# g_dist <- graph_from_adjacency_matrix(dist, mode = "undirected", weighted = TRUE)
+# g_dist
+# 
+# V(g_dist)$color = 2
+# E(g_dist)$color = 2
+# 
+# plot(g_dist, edge.label = E(g_dist)$weight)
+# 
+# sp_dist <- shortest_paths(g_dist, 1, to = V(g_dist))$vpath[[10]]
 
 
+####
 # dt <- st_distance(Atest[1,4],Atest[2,4])
 # class(dt)
 # as.double(dt)
