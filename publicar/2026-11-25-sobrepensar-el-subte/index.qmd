@@ -1,0 +1,571 @@
+---
+title: "Cómo complicar un problema sencillo"
+description: "**Y encontrar una excusa para hablar del subte**"
+author: "Juan Cibantos"
+date: 2026-10-08
+lang: es
+categories: [SobrePensar, R, sf, análisis espacial, transporte, docencia]
+execute:
+  warning: false
+  message: false
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    code-summary: "Código"
+    fig-width: 7
+    fig-height: 6
+    fig-dpi: 150
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# Paquetes: tidyverse, sf, janitor, units, stringi, scales, ggrepel,
+#           knitr, gganimate, gifski, ragg
+library(tidyverse)
+library(sf)
+
+# Rutas relativas a la carpeta del post (Quarto ejecuta el código desde acá)
+source("R/datos.R")
+source("R/graficos.R")
+
+# Formato de números para el texto: 1.234 / 1,2
+num <- function(x, d = 0) format(round(x, d), big.mark = ".", decimal.mark = ",", nsmall = d, trim = TRUE)
+```
+
+```{r}
+#| label: resultados-vecino
+#| include: false
+
+# Red ordenada con el vecino más cercano desde la cabecera 2 (la que usan las
+# pruebas). Se calcula acá para citar los metros en el TL;DR y en la conclusión.
+source("R/ordenar.R")
+
+vecino_desde_cabecera_2 <- function(datos) {
+  d   <- matriz_distancias(datos)
+  n   <- nrow(d)
+  rec <- encontrar_cabeceras(datos)[2]
+
+  for (paso in seq_len(n - 1)) {
+    candidatos <- setdiff(seq_len(n), rec)
+    rec <- c(rec, candidatos[which.min(d[rec[length(rec)], candidatos])])
+  }
+
+  slice(datos, rec)
+}
+
+red_vecino <- leer_estaciones() %>%
+  split(.$linea) %>%
+  map(vecino_desde_cabecera_2)
+
+tramos <- red_vecino %>%
+  map(distancias_consecutivas) %>%
+  list_rbind(names_to = "linea")
+
+media_lineas <- tramos %>%
+  group_by(linea) %>%
+  summarise(media_m = mean(distancia_m))
+
+tramo_min   <- slice_min(tramos, distancia_m, n = 1)
+tramo_max   <- slice_max(tramos, distancia_m, n = 1)
+linea_junta <- slice_min(media_lineas, media_m, n = 1)
+linea_lejos <- slice_max(media_lineas, media_m, n = 1)
+```
+
+::: {.callout-note appearance="simple"}
+## TL;DR
+
+- El dataset oficial de estaciones de subte **no viene ordenado** según el recorrido de cada línea, así que calcular "la distancia entre una estación y la siguiente" no es tan directo como parece.
+- Con **sólo las distancias entre estaciones**, sin otra información, se puede reconstruir el orden: las cabeceras deberían ser el par más lejano.
+- Los atajos (ordenar por distancia a una cabecera, el vecino más cercano, PCA) funcionan en cuando la línea se mantiene relativamente recta y fallan cuando dobla o dos estaciones no consecutivas se acercan demasiado.
+- Las cabeceras no siempre son el par más lejano: en la E, Catalinas está más lejos de Plaza de los Virreyes que Retiro, la cabecera real.
+- Ordenando cada línea con el vecino más cercano desde la cabecera correcta, la distancia media entre estaciones consecutivas es de **`r num(mean(tramos$distancia_m))` m**. El tramo más corto está entre `r tramo_min$desde` y `r tramo_min$hasta` (línea `r tramo_min$linea`, `r num(tramo_min$distancia_m)` m) y el más largo entre `r tramo_max$desde` y `r tramo_max$hasta` (línea `r tramo_max$linea`, `r num(tramo_max$distancia_m)` m).
+- El [dataset de líneas](https://cdn.buenosaires.gob.ar/datosabiertos/datasets/sbase/subte-estaciones/red_subte.geojson) tiene los segmentos individuales y medirlas es objetivamente la manera más sencilla resolverlo, este ejercicio busca explorar algunos algoritmos sencillos para resolver problemas geográficos.
+:::
+
+```{r}
+#| label: fig-zigzag
+#| echo: false
+#| fig-cap: "Todas las líneas, uniendo las estaciones en el orden de las filas del dataset."
+#| fig-height: 7
+
+estaciones_inicio <- leer_estaciones()
+
+estaciones_inicio %>%
+  mutate(x = st_coordinates(geometry)[, 1], y = st_coordinates(geometry)[, 2]) %>%
+  st_drop_geometry() %>%
+  ggplot(aes(x, y, color = linea, group = linea)) +
+  geom_path(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = COLORES_LINEAS) +
+  coord_equal() +
+  labs(x = NULL, y = NULL, color = "Línea") +
+  tema_subte() +
+  theme(axis.text = element_blank(), legend.position = "right")
+```
+
+## El problema
+
+**¿Cuál es la mejor línea de subte de la ciudad?**. 
+
+La respuesta es sencilla, la línea E, por muchísimos motivos que aún no están preparados para escuchar.
+Ahora bien, hay muchos puntos que podemos analizar para responder a esa pregunta de manera más o menos objetiva, y si recientemente te encontraste con una estación cerrada y decidir si caminar a la siguiente, hoy vamos a sobre complejizar cuanto en promedio te tocaría caminar.
+
+ La pregunta es inocente: **¿cuál es la distancia promedio entre estaciones del subte de Buenos Aires?** La Ciudad publica [un dataset con la ubicación de cada estación](https://data.buenosaires.gob.ar/dataset/subte-estaciones) en Buenos Aires Data, así que debería ser cuestión de bajarlo, calcular distancias entre estaciones consecutivas y promediar.
+
+`sf::read_sf()` lee el GeoJSON directo desde la URL, sin descargarlo antes:
+
+```{r}
+#| label: datos-crudos
+
+url_estaciones <- "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/sbase/subte-estaciones/estaciones-de-subte.geojson"
+
+estaciones_crudas <- read_sf(url_estaciones) %>%
+  janitor::clean_names()   # ID, ESTACION, LINEA -> id, estacion, linea
+
+glimpse(estaciones_crudas)
+st_crs(estaciones_crudas)$input
+```
+
+Hay un `id`, el nombre de la estación, la línea y un punto. Para que el ejemplo sea manejable arranco con una sola línea, la **H**, y después generalizo.
+
+::: {.callout-note collapse="true"}
+## Concepto: CRS, o por qué reproyectar antes de medir
+
+Las coordenadas vienen en **WGS84** (EPSG:4326): latitud y longitud en grados. Un grado de longitud no mide lo mismo en Buenos Aires que en el ecuador, así que restar coordenadas "a mano" no da metros.
+
+`sf` resuelve esto de dos maneras:
+
+- Con coordenadas geográficas, `st_distance()` usa la librería **s2** y calcula distancias sobre la esfera.
+- Con un CRS **proyectado**, las coordenadas ya están en metros y la distancia es la euclidiana de toda la vida.
+
+Para todo el post reproyecto a **POSGAR 2007 / Argentina faja 5** (EPSG:5347), el sistema que corresponde para esta parte del país. A la escala de una ciudad, la diferencia entre ambos métodos es mínima (abajo la comparo), pero trabajar en metros simplifica todo lo que viene después, en particular PCA.
+:::
+
+```{r}
+#| label: linea-h
+
+estaciones <- estaciones_crudas %>%
+  st_transform(5347)   # POSGAR 2007 / Argentina faja 5, en metros
+
+linea_h <- estaciones %>%
+  filter(linea == "H")
+
+linea_h %>%
+  st_drop_geometry() %>%
+  select(id, estacion)
+```
+
+### Prueba 1: confiar en el orden del dataset
+
+Asumo que las filas y el id replican el orden del recorrido y mido de cada una a la siguiente.
+
+```{r}
+#| label: prueba-1
+
+n <- nrow(linea_h)
+
+dist_ingenua <- st_distance(
+  linea_h$geometry[-n],
+  linea_h$geometry[-1],
+  by_element = TRUE
+)
+
+mean(dist_ingenua)
+sum(dist_ingenua)
+```
+
+Dibujarlo es la forma más rápida de saber si el número tiene sentido: uno las estaciones en el orden en que aparecen en la tabla.
+
+```{r}
+#| label: fig-prueba-1
+#| fig-cap: "Línea H, uniendo las estaciones en el orden de las filas del dataset."
+
+mapa_orden(linea_h, "Prueba 1: el orden del dataset", etiqueta = "estacion")
+```
+
+**El `id` no sigue el recorrido**, así que el promedio "ingenuo" mezcla saltos entre estaciones que no son vecinas. Y si bien hubiese sido una gran adición para [Accidental aRt](https://accidental-art.tumblr.com/), (que descanse en paz), **antes de medir, tendremos que ordenar**.
+
+::: {.callout-tip collapse="true"}
+## De paso: ¿cuánto cambia medir en grados vs en metros?
+
+```{r}
+#| label: s2-vs-proyectado
+
+linea_h_wgs84 <- st_transform(linea_h, 4326)
+
+tibble(
+  esfera_s2  = sum(st_distance(linea_h_wgs84$geometry[-n], linea_h_wgs84$geometry[-1], by_element = TRUE)),
+  plano_5347 = sum(dist_ingenua)
+) %>%
+  mutate(diferencia_pct = as.numeric((plano_5347 - esfera_s2) / esfera_s2 * 100))
+```
+
+A esta escala, si bien todavía la distancia no es la real (ya quisiéramos, es la mitad), la diferencia es despreciable.
+:::
+
+## Primera idea: las cabeceras
+
+Si no tengo el orden, ¿qué tengo? Las **distancias entre todas las estaciones**. Y hay algo que esas distancias tienen que cumplir en cualquier línea más o menos recta: **las dos estaciones más lejanas entre sí son las puntas**.
+
+### Prueba 2: el máximo de la matriz de distancias
+
+```{r}
+#| label: prueba-2-matriz
+
+distancias <- units::drop_units(st_distance(linea_h))
+
+dim(distancias)
+round(distancias[1:12, 1:12])
+```
+
+::: {.callout-note collapse="true"}
+## Concepto: la matriz de distancias
+
+`st_distance(x)` con un solo argumento devuelve una matriz de $n \times n$ donde la celda $(i, j)$ es la distancia entre la estación $i$ y la $j$. Tiene dos propiedades que conviene tener presentes:
+
+- **Diagonal en cero**: la distancia de una estación a sí misma.
+- **Simetría**: $d(i, j) = d(j, i)$. Toda la información está en el triángulo superior (o en el inferior).
+
+La simetría tiene una consecuencia práctica inmediata, como se ve en la próxima prueba.
+:::
+
+```{r}
+#| label: prueba-2-maximo
+
+which(distancias == max(distancias), arr.ind = TRUE)
+```
+
+Aparecen **dos filas**, porque el máximo está una vez en $(i, j)$ y otra en $(j, i)$. Los dos índices de una de esas filas son las dos cabeceras.
+
+```{r}
+#| label: prueba-2-cabeceras
+
+indices_cabeceras <- which(distancias == max(distancias), arr.ind = TRUE)[1, ]
+
+linea_h %>%
+  slice(indices_cabeceras)
+```
+
+**Funciona.** Facultad de Derecho y Hospitales son las cabeceras de la H. Con las puntas identificadas, falta ordenar las del medio.
+
+## ¿Y las del medio?
+
+### Prueba 3: ordenar por distancia a una cabecera
+
+La idea más simple que se me ocurre es ordenar todas las estaciones según qué tan lejos están de una cabecera: la más cercana va segunda, la que sigue tercera, etc.
+
+```{r}
+#| label: prueba-3
+
+inicio <- indices_cabeceras[2]   # Hospitales: recorro de sur a norte
+
+linea_h_p3 <- linea_h %>%
+  slice(order(distancias[inicio, ]))
+```
+
+```{r}
+#| label: fig-prueba-3
+#| fig-cap: "Prueba 3: ordenar por distancia a una cabecera."
+
+mapa_orden(linea_h_p3, "Prueba 3: distancia a una cabecera", etiqueta = "estacion")
+```
+
+**Funciona!** En un tramo relativamente recto anda perfecto, útil para las líneas de la Ciudad. Pero la distancia a la cabecera es una distancia **en línea recta**, y si dos estaciones intermedias no consecutivas se acercaran, por ejemplo debido a una curva muy pronunciada, produciría resultados erróneos.
+
+### Prueba 4: el vecino más cercano
+
+En lugar de mirar siempre la cabecera, avanzo **paso a paso**: desde la estación actual, voy a la más cercana que todavía no visité.
+
+```{r}
+#| label: prueba-4
+
+recorrido <- inicio
+
+for (paso in seq_len(n - 1)) {
+  actual     <- recorrido[length(recorrido)]
+  candidatos <- setdiff(seq_len(n), recorrido)
+  siguiente  <- candidatos[which.min(distancias[actual, candidatos])]
+  recorrido  <- c(recorrido, siguiente)
+}
+
+linea_h_p4 <- slice(linea_h, recorrido)
+```
+
+```{r}
+#| label: fig-prueba-4
+#| fig-cap: "Prueba 4: vecino más cercano desde una cabecera."
+
+mapa_orden(linea_h_p4, "Prueba 4: vecino más cercano", etiqueta = "estacion")
+```
+
+**Es más robusto**, porque cada decisión es local. Pero es un algoritmo **greedy** (goloso) que nunca vuelve atrás. Si en algún paso dos estaciones están casi a la misma distancia y elige "mal", puede saltearse una y tener que volver a buscarla al final, con un salto largo.
+
+```{r}
+#| label: animar-vecino
+#| echo: false
+
+library(gganimate)
+
+animar_vecino <- function(datos, inicio, titulo, ficticias = integer(0)) {
+  dist  <- units::drop_units(st_distance(datos))
+  n     <- nrow(datos)
+  color <- COLORES_LINEAS[datos$linea[1]]
+
+  # Vecino más cercano, igual que arriba
+  rec <- inicio
+  for (paso in seq_len(n - 1)) {
+    actual     <- rec[length(rec)]
+    candidatos <- setdiff(seq_len(n), rec)
+    rec        <- c(rec, candidatos[which.min(dist[actual, candidatos])])
+  }
+
+  xy <- as_tibble(st_coordinates(datos)) %>%
+    mutate(i = row_number(), ficticia = i %in% ficticias)
+
+  candidatos_df <- map(seq_len(n - 1), \(k) {
+    actual     <- rec[k]
+    candidatos <- setdiff(seq_len(n), rec[1:k])
+    d          <- dist[actual, candidatos]   # fuera del tibble: actual es un solo índice
+
+    tibble(
+      paso      = k,
+      actual    = actual,
+      candidato = candidatos,
+      d         = d,
+      elegido   = candidatos == rec[k + 1]
+    )
+  }) %>%
+    list_rbind() %>%
+    left_join(xy, by = c("actual" = "i")) %>%
+    left_join(xy, by = c("candidato" = "i"), suffix = c("", "_fin"))
+
+  # El paso n es el estado final, con el recorrido completo
+  recorrido_df <- map(seq_len(n), \(k) tibble(paso = k, i = rec[1:k])) %>%
+    list_rbind() %>%
+    left_join(xy, by = "i")
+
+  p <- ggplot() +
+    geom_point(data = xy, aes(X, Y, shape = ficticia), color = "grey60", size = 3) +
+    geom_segment(
+      data = candidatos_df,
+      aes(X, Y, xend = X_fin, yend = Y_fin, linetype = elegido, alpha = elegido),
+      color = color, linewidth = 0.8
+    ) +
+    geom_text(
+      data = filter(candidatos_df, elegido),
+      aes((X + X_fin) / 2, (Y + Y_fin) / 2, label = paste(num(d), "m")),
+      size = 3, nudge_x = 150
+    ) +
+    geom_path(data = recorrido_df, aes(X, Y), color = "grey20", linewidth = 1.2) +
+    geom_point(
+      data = recorrido_df %>% group_by(paso) %>% slice_tail(n = 1),
+      aes(X, Y), color = "black", size = 4
+    ) +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 1)) +   # ficticias huecas
+    scale_linetype_manual(values = c(`TRUE` = "solid", `FALSE` = "dotted")) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.4)) +
+    coord_equal() +
+    labs(x = NULL, y = NULL, title = paste(titulo, "· paso {closest_state}")) +
+    tema_subte() +
+    theme(axis.text = element_blank()) +
+    transition_states(paso, transition_length = 1, state_length = 2)
+
+  # Render explícito: tamaño acotado y gifski, que escribe el GIF cuadro a cuadro
+  # (el renderer por defecto, magick, carga todos los cuadros en memoria)
+  animate(
+    p,
+    nframes  = 10 * n,
+    fps      = 10,
+    width    = 700,
+    height   = 700,
+    units    = "px",   # dentro de knitr, gganimate asume pulgadas: 700 in = 70.000 px
+    res      = 100,
+    device   = "ragg_png",
+    renderer = gifski_renderer()
+  )
+}
+```
+
+Para ver exactamente dónde falla, en la imágen de la derecha agrego dos estaciones que simulan,con una curva exagerada, la extensión nunca finalizada de la traza a retiro y el "plan" de la estación Padre Mugica en el barrio 31.
+
+```{r}
+#| label: linea-h-extendida
+#| echo: false
+
+facultad <- linea_h %>% filter(str_detect(estacion, "FACULTAD"))
+xy_fac   <- st_coordinates(facultad)
+
+separacion_m <- 600   # distancia entre ficticias
+
+ficticias <- tibble(
+  id       = c(901, 902),
+  estacion = c("Padre Mugica", "Retiro"),
+  linea    = "H",
+  x        = xy_fac[1, "X"],
+  y        = xy_fac[1, "Y"] - separacion_m * 1:2   # hacia el sur: -Y en EPSG:5347
+) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(linea_h))
+
+# Las ficticias van al final: los índices de linea_h (e `inicio`) siguen valiendo
+linea_h_ext <- rbind(
+  select(linea_h, id, estacion, linea),
+  ficticias
+)
+```
+
+
+```{r}
+#| label: fig-prueba-4-pasos
+#| echo: false
+#| layout-ncol: 2
+#| fig-cap: "Vecino más cercano paso a paso, desde Hospitales."
+#| fig-subcap:
+#|   - "Línea H real."
+#|   - "Con dos estaciones ficticias al sur de Facultad de Derecho: el gancho confunde al algoritmo."
+
+# Cada GIF con nombre propio: si se imprimen directo, knitr los escribe en el
+# mismo archivo y el segundo pisa al primero
+dir_figs <- knitr::opts_current$get("fig.path")
+dir.create(dir_figs, showWarnings = FALSE, recursive = TRUE)
+
+gif_real <- paste0(dir_figs, "vecino-h-real.gif")
+gif_ext  <- paste0(dir_figs, "vecino-h-ficticias.gif")
+
+anim_save(gif_real, animar_vecino(linea_h, inicio = inicio, titulo = "Línea H"))
+anim_save(gif_ext, animar_vecino(
+  linea_h_ext,
+  inicio    = inicio,
+  titulo    = "Línea H + 2 ficticias",
+  ficticias = which(linea_h_ext$id %in% c(901, 902))
+))
+
+knitr::include_graphics(c(gif_real, gif_ext))
+```
+
+::: {.callout-warning}
+Este algoritmo depende de que las cabeceras efectivamente sean las más lejanas y de elegir la correcta. Me di cuenta (tarde) de que en la línea E, Retiro está más cerca de Plaza de los Virreyes que Catalinas: si arrancamos desde Catalinas, hay un salto.
+:::
+
+```{r}
+#| label: fig-prueba-4-linea-e
+#| echo: false
+#| layout-ncol: 2
+#| fig-cap: "Línea E: el mismo algoritmo, arrancando desde cada punta del par más lejano."
+#| fig-subcap:
+#|   - "Desde Plaza de los Virreyes: recorre la línea entera."
+#|   - "Desde Catalinas: le queda una estación varada y termina con un salto."
+
+linea_e   <- estaciones %>% filter(linea == "E")
+d_e       <- units::drop_units(st_distance(linea_e))
+cabeceras <- which(d_e == max(d_e), arr.ind = TRUE)[1, ]
+
+nombre <- \(i) str_to_title(linea_e$estacion[i])
+
+gif_e_ok    <- paste0(dir_figs, "vecino-e-cabecera-2.gif")
+gif_e_salto <- paste0(dir_figs, "vecino-e-cabecera-1.gif")
+
+anim_save(gif_e_ok, animar_vecino(
+  linea_e, inicio = cabeceras[2], titulo = paste("Línea E desde", nombre(cabeceras[2]))
+))
+anim_save(gif_e_salto, animar_vecino(
+  linea_e, inicio = cabeceras[1], titulo = paste("Línea E desde", nombre(cabeceras[1]))
+))
+
+knitr::include_graphics(c(gif_e_ok, gif_e_salto))
+```
+
+Para [otros ejemplos gráficos](https://stemlounge.com/animated-algorithms-for-the-traveling-salesman-problem/) de como funciona este algoritmo, y por qué si bien es rápido, **no es el adecuado para este problema**.
+
+### Prueba 5: PCA
+
+Otra forma de pensarlo: si la línea es aproximadamente recta, existe una **dirección** sobre la que se extiende. El análisis de componentes principales (PCA) encuentra justamente esa dirección, la de mayor varianza. Proyecto cada estación sobre ese eje y ordeno por la proyección.
+
+```{r}
+#| label: prueba-5
+
+coords <- st_coordinates(linea_h)
+pca <- prcomp(coords)
+
+summary(pca)$importance
+
+linea_h_p5 <- slice(linea_h, order(pca$x[, 1]))
+```
+
+```{r}
+#| label: fig-prueba-5
+#| fig-cap: "Prueba 5: orden según la proyección sobre el primer componente principal."
+
+mapa_orden(linea_h_p5, "Prueba 5: PCA", etiqueta = "estacion")
+```
+
+**Es elegante** y no necesita saber dónde están las cabeceras. Pero sufre la misma limitación que la prueba 3: si la línea dobla, dos estaciones pueden proyectarse casi en el mismo punto del eje aunque estén lejos en el recorrido. 
+
+## ¿Y entonces?
+
+Cinco pruebas y una sola línea. Confiar en el orden del dataset fue lo único que falló de entrada. Las cabeceras salieron del máximo de la matriz de distancias, y para las estaciones del medio la distancia a una cabecera y el vecino más cercano devolvieron el recorrido de la H sin problemas. PCA llega a lo mismo por otro camino. 
+
+Las tres son lo que se llama [heurísticas](https://es.wikipedia.org/wiki/Heur%C3%ADstica#La_heur%C3%ADstica_como_metodolog%C3%ADa_cient%C3%ADfica): atajos razonables que suelen dar una buena respuesta, sin garantía de que sea la correcta. Y comparten la misma limitación: funcionan porque los subtes se extienden de manera radial o lineal. Alcanzó con estirarla hacia Retiro, para que el vecino más cercano se perdiera. La distancia a la cabecera y PCA se rompen igual en cuanto la traza dobla sobre sí misma. Y la E muestra que ni siquiera las cabeceras son seguras: el par más lejano es Plaza de los Virreyes y Catalinas, no Retiro.
+
+Con esos cuidados, la pregunta del bar tiene una primera respuesta. Ordenando cada línea con el vecino más cercano desde la cabecera correcta, la distancia promedio entre estaciones consecutivas es de **`r num(mean(tramos$distancia_m))` m**. El tramo más corto está entre `r tramo_min$desde` y `r tramo_min$hasta` (línea `r tramo_min$linea`, `r num(tramo_min$distancia_m)` m) y el más largo entre `r tramo_max$desde` y `r tramo_max$hasta` (línea `r tramo_max$linea`, `r num(tramo_max$distancia_m)` m). La línea con las estaciones más juntas es la `r linea_junta$linea` (`r num(linea_junta$media_m)` m en promedio) y la más espaciada, la `r linea_lejos$linea` (`r num(linea_lejos$media_m)` m).
+
+La solución, para todas las líneas: el vecino más cercano de la prueba 4, arrancando desde la segunda cabecera del par más lejano.
+
+```{r}
+#| label: solucion
+
+vecino_desde_cabecera_2 <- function(datos) {
+  d <- units::drop_units(st_distance(datos))
+  n <- nrow(d)
+
+  cabeceras <- which(d == max(d), arr.ind = TRUE)[1, ]
+  recorrido <- cabeceras[2]
+
+  for (paso in seq_len(n - 1)) {
+    actual     <- recorrido[length(recorrido)]
+    candidatos <- setdiff(seq_len(n), recorrido)
+    siguiente  <- candidatos[which.min(d[actual, candidatos])]
+    recorrido  <- c(recorrido, siguiente)
+  }
+
+  slice(datos, recorrido)
+}
+
+red_ordenada <- estaciones %>%
+  split(.$linea) %>%
+  map(vecino_desde_cabecera_2) %>%
+  do.call(rbind, .)
+```
+
+```{r}
+#| label: fig-red-ordenada
+#| fig-cap: "La red reconstruida usando sólo distancias entre estaciones, con el vecino más cercano."
+#| fig-height: 7
+#| code-fold: true
+#| code-summary: "Código del mapa"
+
+red_ordenada %>%
+  mutate(x = st_coordinates(geometry)[, 1], y = st_coordinates(geometry)[, 2]) %>%
+  st_drop_geometry() %>%
+  ggplot(aes(x, y, color = linea, group = linea)) +
+  geom_path(linewidth = 1.4) +
+  geom_point(size = 2, fill = "white", shape = 21, stroke = 1) +
+  scale_color_manual(values = COLORES_LINEAS) +
+  coord_equal() +
+  labs(x = NULL, y = NULL, color = "Línea") +
+  tema_subte() +
+  theme(axis.text = element_blank(), legend.position = "right")
+```
+
+Pero ese número depende de haber elegido bien desde dónde arrancar. Para no depender de eso necesito un método que no asuma que la línea es recta, y resulta que ese problema ya tiene nombre: el del viajante. Queda para la próxima.
+
+r
+
+---
+
+*Código y datos: [github.com/jpcib/subte_estaciones](https://github.com/jpcib/subte_estaciones). Fuente: [Buenos Aires Data](https://data.buenosaires.gob.ar/), estaciones de subte.*
