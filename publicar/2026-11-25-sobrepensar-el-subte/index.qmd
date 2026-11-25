@@ -34,6 +34,9 @@ library(sf)
 source("R/datos.R")
 source("R/graficos.R")
 
+# Fondo de papel en todo el PNG: con coord_equal() ggplot deja franjas fuera del plot
+knitr::opts_chunk$set(dev.args = list(bg = ATLAS[["placa"]]))
+
 # Formato de números para el texto: 1.234 / 1,2
 num <- function(x, d = 0) format(round(x, d), big.mark = ".", decimal.mark = ",", nsmall = d, trim = TRUE)
 ```
