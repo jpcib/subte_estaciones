@@ -564,8 +564,6 @@ red_ordenada %>%
 
 Pero ese número depende de haber elegido bien desde dónde arrancar. Para no depender de eso necesito un método que no asuma que la línea es recta, y resulta que ese problema ya tiene nombre: el del viajante. Queda para la próxima.
 
-r
-
 ---
 
 *Código y datos: [github.com/jpcib/subte_estaciones](https://github.com/jpcib/subte_estaciones). Fuente: [Buenos Aires Data](https://data.buenosaires.gob.ar/), estaciones de subte.*
